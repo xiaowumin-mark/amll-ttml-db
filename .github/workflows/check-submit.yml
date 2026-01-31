@@ -3,35 +3,53 @@ on:
   workflow_dispatch:
   issues:
     types: [labeled]
+  issue_comment:
+    types: [created]
+
 concurrency:
-  group: check-submit
+  group: check-submit-rust-${{ github.event.issue.number || github.run_id }}
   cancel-in-progress: true
 
+permissions:
+  issues: write
+  pull-requests: write
+  contents: write
+
 jobs:
-  check-submit:
-    if: github.event.label.name == '歌词提交/补正'
+  check-submit-rust:
+    if: |
+      (github.event_name == 'issues' && github.event.label.name == '歌词提交/补正') ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request != null && github.event.sender.type != 'Bot' && startsWith(github.event.comment.body, '/'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: 签出代码
-        uses: actions/checkout@v3
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - name: 安装 Node.js
-        uses: actions/setup-node@v3
+
+      - name: 安装 Rust 环境
+        uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          node-version: 20
-          cache: yarn
-          cache-dependency-path: scripts/yarn.lock
-      - name: 安装依赖
-        run: yarn
+          cache: false
+
+      - name: 缓存 Cargo 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./scripts -> target
+
+      - name: 编译 Rust 程序
+        run: cargo build -p lyric_checker_bot
         working-directory: scripts
+
       - name: 运行检查程序
         timeout-minutes: 10
-        run: |
-          git config --global user.name 'github-actions'
-          git config --global user.email 'github-actions@users.noreply.github.com'
-          yarn node ./run-submit-check.js
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          ./target/debug/lyric_checker_bot
         working-directory: scripts
