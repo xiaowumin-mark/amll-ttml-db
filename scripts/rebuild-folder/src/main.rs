@@ -12,7 +12,6 @@ use std::{
 use anyhow::{Context, Result};
 use chrono::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle};
-use lyrics_helper_core::{DefaultLanguageOptions, TtmlParsingOptions};
 use rayon::prelude::*;
 use ttml_processor::parse_ttml;
 use zip::write::SimpleFileOptions;
@@ -200,6 +199,10 @@ fn load_raw_lyrics(raw_dir: &Path) -> Result<Vec<std::fs::DirEntry>> {
             let file_name_os = entry.file_name();
             let file_name = file_name_os.to_string_lossy();
 
+            if file_name == "raw-lyrics.zip" || file_name == "version.json" {
+                return None;
+            }
+
             match RawLyricInfo::from_str(&file_name) {
                 Ok(info) => Some((info, entry)),
                 Err(e) => {
@@ -216,60 +219,119 @@ fn load_raw_lyrics(raw_dir: &Path) -> Result<Vec<std::fs::DirEntry>> {
 }
 
 fn process_lyric_content(file_content: &str) -> Result<ParsedLyric> {
-    let parse_opts = TtmlParsingOptions {
-        force_timing_mode: None,
-        default_languages: DefaultLanguageOptions::default(),
-    };
+    let ttml_result = parse_ttml(file_content)?;
 
-    let parsed_source_data = parse_ttml(file_content, &parse_opts)?;
     let mut lines = Vec::new();
 
-    for new_line in parsed_source_data.lines {
-        // agent 为 None 或 v1，视为非对唱，其他情况视为对唱
-        let is_duet = !matches!(new_line.agent.as_deref(), Some("v1") | None);
-        let mut process_and_push_track = |track: &lyrics_helper_core::AnnotatedTrack,
-                                          is_bg: bool| {
-            let mut words = Vec::new();
-            for syl in track.content.syllables() {
-                words.push(amll_lyric::LyricWord {
-                    start_time: syl.start_ms,
-                    end_time: syl.end_ms,
-                    word: Cow::Owned(syl.text.clone()),
-                });
+    for new_line in ttml_result.lines {
+        // agent_id 为 None 或 v1，视为非对唱，其他情况视为对唱
+        let is_duet = !matches!(new_line.agent_id.as_deref(), Some("v1") | None);
 
-                // AMLL 的历史遗留问题，用时间戳均为0的音节表示空格
-                if syl.ends_with_space {
-                    words.push(amll_lyric::LyricWord {
-                        start_time: 0,
-                        end_time: 0,
-                        word: " ".into(),
-                    });
+        let process_words = |words: Option<&Vec<ttml_processor::model::Syllable>>,
+                             fallback_text: &str,
+                             start_time: u32,
+                             end_time: u32|
+         -> Vec<amll_lyric::LyricWord<'static>> {
+            let mut amll_words = Vec::new();
+
+            match words {
+                Some(syls) if !syls.is_empty() => {
+                    for syl in syls {
+                        amll_words.push(amll_lyric::LyricWord {
+                            start_time: u64::from(syl.start_time),
+                            end_time: u64::from(syl.end_time),
+                            word: Cow::Owned(syl.text.clone()),
+                        });
+
+                        // AMLL 的历史遗留问题，用时间戳均为0的音节表示空格
+                        if syl.ends_with_space.unwrap_or(false) {
+                            amll_words.push(amll_lyric::LyricWord {
+                                start_time: 0,
+                                end_time: 0,
+                                word: " ".into(),
+                            });
+                        }
+                    }
+                }
+                _ => {
+                    if !fallback_text.is_empty() {
+                        amll_words.push(amll_lyric::LyricWord {
+                            start_time: u64::from(start_time),
+                            end_time: u64::from(end_time),
+                            word: Cow::Owned(fallback_text.to_string()),
+                        });
+                    }
                 }
             }
 
-            lines.push(amll_lyric::LyricLine {
-                words,
-                translated_lyric: Cow::Owned(String::new()),
-                roman_lyric: Cow::Owned(String::new()),
-                is_bg,
-                is_duet,
-                start_time: new_line.start_ms,
-                end_time: new_line.end_ms,
-            });
+            amll_words
         };
 
-        if let Some(track) = new_line.main_track() {
-            process_and_push_track(track, false);
-        }
+        lines.push(amll_lyric::LyricLine {
+            words: process_words(
+                new_line.words.as_ref(),
+                &new_line.text,
+                new_line.start_time,
+                new_line.end_time,
+            ),
+            translated_lyric: Cow::Owned(String::new()),
+            roman_lyric: Cow::Owned(String::new()),
+            is_bg: false,
+            is_duet,
+            start_time: u64::from(new_line.start_time),
+            end_time: u64::from(new_line.end_time),
+        });
 
-        if let Some(track) = new_line.background_track() {
-            process_and_push_track(track, true);
+        if let Some(bg) = &new_line.background_vocal {
+            lines.push(amll_lyric::LyricLine {
+                words: process_words(bg.words.as_ref(), &bg.text, bg.start_time, bg.end_time),
+                translated_lyric: Cow::Owned(String::new()),
+                roman_lyric: Cow::Owned(String::new()),
+                is_bg: true,
+                is_duet,
+                start_time: u64::from(bg.start_time),
+                end_time: u64::from(bg.end_time),
+            });
         }
     }
 
     let mut metadata = Vec::new();
-    for (k, v) in parsed_source_data.raw_metadata {
-        metadata.push((k, v));
+    let meta = ttml_result.metadata;
+
+    if let Some(v) = meta.author_ids {
+        metadata.push(("ttmlAuthorGithub".to_string(), v));
+    }
+    if let Some(v) = meta.author_names {
+        metadata.push(("ttmlAuthorGithubLogin".to_string(), v));
+    }
+    if let Some(platforms) = meta.platform_ids {
+        for (p_id, ids) in platforms {
+            let key = match p_id {
+                ttml_processor::model::PlatformId::NcmMusicId => "ncmMusicId",
+                ttml_processor::model::PlatformId::QqMusicId => "qqMusicId",
+                ttml_processor::model::PlatformId::SpotifyId => "spotifyId",
+                ttml_processor::model::PlatformId::AppleMusicId => "appleMusicId",
+            };
+            metadata.push((key.to_string(), ids));
+        }
+    }
+    if let Some(raw) = meta.raw_properties {
+        for (k, v) in raw {
+            metadata.push((k, v));
+        }
+    }
+
+    if let Some(v) = meta.title {
+        metadata.push(("musicName".to_string(), v));
+    }
+    if let Some(v) = meta.artist {
+        metadata.push(("artists".to_string(), v));
+    }
+    if let Some(v) = meta.album {
+        metadata.push(("album".to_string(), v));
+    }
+    if let Some(v) = meta.isrc {
+        metadata.push(("isrc".to_string(), v));
     }
 
     metadata.sort_by(|a, b| a.0.cmp(&b.0));
@@ -354,15 +416,6 @@ fn generate_contributor_report(
         md_file,
         "> 本排名由机器人根据已在库歌词统计元数据信息后自动生成，贡献最多排前，同贡献量排名不分先后。"
     )?;
-
-    let cst_offset = FixedOffset::east_opt(8 * 3600).expect("创建时区失败");
-    let now_cst = Utc::now().with_timezone(&cst_offset);
-
-    writeln!(
-        md_file,
-        "> \n> 最后更新于 {} (UTC+8)",
-        now_cst.format("%Y-%m-%d %H:%M")
-    )?;
     writeln!(md_file)?;
 
     writeln!(
@@ -407,7 +460,7 @@ fn generate_zip_archive(layout: &ProjectLayout, entries: &[std::fs::DirEntry]) -
     println!("正在生成 raw-lyrics.zip 压缩包...");
     let start = Instant::now();
 
-    let zip_path = layout.root.join("raw-lyrics.zip");
+    let zip_path = layout.raw_dir.join("raw-lyrics.zip");
     let file = File::create(&zip_path).context("无法创建压缩包文件")?;
 
     let mut zip = zip::ZipWriter::new(file);
@@ -711,7 +764,7 @@ fn main() -> Result<()> {
         "file_count": raw_lyrics.len(),
     });
 
-    let version_file_path = layout.root.join("version.json");
+    let version_file_path = layout.raw_dir.join("version.json");
     let version_file = std::fs::File::create(&version_file_path)?;
     serde_json::to_writer_pretty(version_file, &version_info)?;
 
@@ -723,8 +776,7 @@ fn main() -> Result<()> {
         } else {
             println!("工作树已变更，正在提交更改");
             add_file_to_git("../..")?;
-            let time = Utc::now();
-            commit(&format!("于 {time:?} 重新构建更新"))?;
+            commit("重新构建歌词文件夹")?;
             push("main")?;
 
             println!("文件夹重建完毕！耗时: {:?}", t.elapsed());
